@@ -23,7 +23,7 @@ use crate::{
 };
 
 pub(super) struct InferenceHost {
-    pub request: Py<PyDict>,
+    request: Option<Py<PyDict>>,
     module: &'static str,
 }
 
@@ -34,17 +34,35 @@ pub(super) struct ProjectedCall {
 }
 
 impl InferenceHost {
-    pub fn new(request: Py<PyDict>, module: &'static str) -> Self {
-        Self { request, module }
+    pub fn new(module: &'static str) -> Self {
+        Self {
+            request: None,
+            module,
+        }
+    }
+
+    fn request<'py>(&self, py: Python<'py>) -> Bound<'py, PyDict> {
+        self.request
+            .as_ref()
+            .map_or_else(|| PyDict::new(py), |request| request.bind(py).clone())
+    }
+
+    pub fn close(&mut self) {
+        self.request = None;
+    }
+
+    pub fn traverse(&self, visit: &pyo3::gc::PyVisit<'_>) -> Result<(), pyo3::gc::PyTraverseError> {
+        visit.call(&self.request)
     }
 
     pub fn project(
-        &self,
+        &mut self,
         py: Python<'_>,
         arguments: &Bound<'_, PyDict>,
         input: &str,
     ) -> PyResult<ProjectedCall> {
-        let argument = |name: &str| self.argument(py, arguments, name);
+        self.request = Some(arguments.clone().unbind());
+        let argument = |name: &str| present(arguments, name);
         let string = |name: &str| -> PyResult<Option<String>> {
             argument(name)?.map(|value| value.extract()).transpose()
         };
@@ -87,15 +105,6 @@ impl InferenceHost {
         })
     }
 
-    pub fn argument<'py>(
-        &self,
-        py: Python<'py>,
-        arguments: &Bound<'py, PyDict>,
-        name: &str,
-    ) -> PyResult<Option<Bound<'py, PyAny>>> {
-        present(arguments, self.request.bind(py), name)
-    }
-
     pub fn parameters(
         &self,
         py: Python<'_>,
@@ -103,7 +112,7 @@ impl InferenceHost {
     ) -> PyResult<Map<String, Value>> {
         let names: Vec<String> = py.import(self.module)?.getattr("PARAMETERS")?.extract()?;
         project_optional_fields(names.iter().map(String::as_str), |name| {
-            self.argument(py, arguments, name)
+            present(arguments, name)
         })
     }
 
@@ -130,7 +139,7 @@ impl InferenceHost {
         let mapped = py
             .import(self.module)?
             .getattr("map_failure")?
-            .call1((native.value(py), self.request.bind(py)))?;
+            .call1((native.value(py), self.request(py)))?;
         Ok(PyErr::from_value(mapped))
     }
 }

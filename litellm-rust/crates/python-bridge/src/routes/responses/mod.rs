@@ -33,7 +33,7 @@ fn run_responses(py: Python<'_>, call: NativeCall<'_>, asynchronous: bool) -> Py
     {
         return Err(RustBridgeDeclined::new_err(reason));
     }
-    let argument = |name: &str| present(&call.kwargs, &call.base, name);
+    let argument = |name: &str| present(&resolved, name);
     let model = argument("model")?
         .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("model is required"))?
         .extract::<String>()?;
@@ -61,7 +61,7 @@ fn run_responses(py: Python<'_>, call: NativeCall<'_>, asynchronous: bool) -> Py
             "native Python responses streaming",
         ));
     }
-    let host = InferenceHost::new(resolved.unbind(), ROUTE_HOST_MODULE);
+    let host = InferenceHost::new(ROUTE_HOST_MODULE);
     run_inference::<ResponsesRoute, _>(py, call, asynchronous, ResponsesPythonHost(host))
 }
 

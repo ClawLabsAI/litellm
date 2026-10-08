@@ -63,6 +63,26 @@ fn merge_headers(
     (!merged.is_empty()).then_some(merged)
 }
 
+fn merged_headers_of(arguments: &Bound<'_, PyDict>) -> PyResult<Option<Map<String, Value>>> {
+    let mapping = |name: &str| -> PyResult<Option<Map<String, Value>>> {
+        present(arguments, name)?
+            .map(|value| from_py(&value))
+            .transpose()
+    };
+    Ok(merge_headers(
+        mapping("headers")?,
+        mapping("extra_headers")?,
+    ))
+}
+
+fn provider_specific_header_of(
+    arguments: &Bound<'_, PyDict>,
+) -> PyResult<Option<ProviderSpecificHeaders>> {
+    present(arguments, "provider_specific_header")?
+        .map(|value| from_py(&value))
+        .transpose()
+}
+
 fn native_error(py: Python<'_>, error: Error) -> PyResult<PyErr> {
     match error {
         Error::Transport(TransportError::Http { status, body }) => {
@@ -89,16 +109,22 @@ fn native_error(py: Python<'_>, error: Error) -> PyResult<PyErr> {
 /// The Python side of the Messages route: projects the prepared arguments and builds the
 /// public response, chunks and exceptions.
 pub(super) struct MessagesPythonHost {
-    request: Py<PyDict>,
+    request: Option<Py<PyDict>>,
     cache: PythonCache,
 }
 
 impl MessagesPythonHost {
-    pub(super) fn new(request: Py<PyDict>, asynchronous: bool) -> Self {
+    pub(super) fn new(asynchronous: bool) -> Self {
         Self {
-            request,
+            request: None,
             cache: PythonCache::new(asynchronous),
         }
+    }
+
+    fn request<'py>(&self, py: Python<'py>) -> Bound<'py, PyDict> {
+        self.request
+            .as_ref()
+            .map_or_else(|| PyDict::new(py), |request| request.bind(py).clone())
     }
 
     fn projection(
@@ -106,8 +132,7 @@ impl MessagesPythonHost {
         py: Python<'_>,
         arguments: &Bound<'_, PyDict>,
     ) -> PyResult<Result<MessagesCall, Error>> {
-        let request = self.request.bind(py);
-        let argument = |name: &str| present(arguments, request, name);
+        let argument = |name: &str| present(arguments, name);
         let string = |name: &str| -> PyResult<Option<String>> {
             argument(name)?.map(|value| value.extract()).transpose()
         };
@@ -130,8 +155,8 @@ impl MessagesPythonHost {
         let shaping = self.shaping(py, &model, custom_llm_provider.as_deref(), arguments)?;
         let api_key = string("api_key")?;
         let api_base = string("api_base")?;
-        let extra_headers = self.merged_headers(py, arguments)?;
-        let provider_specific_header = self.provider_specific_header(py, arguments)?;
+        let extra_headers = merged_headers_of(arguments)?;
+        let provider_specific_header = provider_specific_header_of(arguments)?;
         Ok(messages_body(body).map(|body| MessagesCall {
             body,
             api_key,
@@ -142,33 +167,6 @@ impl MessagesPythonHost {
             timeout: optional_timeout(timeout),
             shaping,
         }))
-    }
-
-    fn merged_headers(
-        &self,
-        py: Python<'_>,
-        arguments: &Bound<'_, PyDict>,
-    ) -> PyResult<Option<Map<String, Value>>> {
-        let request = self.request.bind(py);
-        let mapping = |name: &str| -> PyResult<Option<Map<String, Value>>> {
-            present(arguments, request, name)?
-                .map(|value| from_py(&value))
-                .transpose()
-        };
-        Ok(merge_headers(
-            mapping("headers")?,
-            mapping("extra_headers")?,
-        ))
-    }
-
-    fn provider_specific_header(
-        &self,
-        py: Python<'_>,
-        arguments: &Bound<'_, PyDict>,
-    ) -> PyResult<Option<ProviderSpecificHeaders>> {
-        present(arguments, self.request.bind(py), "provider_specific_header")?
-            .map(|value| from_py(&value))
-            .transpose()
     }
 
     fn shaping(
@@ -193,8 +191,7 @@ impl MessagesPythonHost {
     }
 
     fn provider(&self, py: Python<'_>) -> String {
-        self.request
-            .bind(py)
+        self.request(py)
             .get_item("custom_llm_provider")
             .ok()
             .flatten()
@@ -209,7 +206,7 @@ impl MessagesPythonHost {
         let mapped = py
             .import(ROUTE_HOST_MODULE)
             .and_then(|module| module.getattr("map_failure"))
-            .and_then(|map| map.call1((error.value(py), self.request.bind(py), self.provider(py))))
+            .and_then(|map| map.call1((error.value(py), self.request(py), self.provider(py))))
             .and_then(|mapped| {
                 mapped
                     .extract::<Py<pyo3::exceptions::PyBaseException>>()
@@ -231,6 +228,7 @@ impl PythonBinding for MessagesPythonHost {
         py: Python<'_>,
         arguments: &Bound<'_, PyDict>,
     ) -> Result<(MessagesCall, Selection), InvokeError<Error>> {
+        self.request = Some(arguments.clone().unbind());
         let selection =
             crate::cache::configure(&mut self.cache, py, arguments, "anthropic_messages")
                 .map_err(InvokeError::Python)?;
@@ -308,6 +306,7 @@ impl PythonHostCalls<Cached<Messages>> for MessagesPythonHost {
 
 impl PythonOwned for MessagesPythonHost {
     fn close(&mut self, _: Python<'_>) {
+        self.request = None;
         self.cache.close();
     }
     fn traverse(&self, visit: &PyVisit<'_>) -> Result<(), PyTraverseError> {
